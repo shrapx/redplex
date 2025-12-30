@@ -3,6 +3,7 @@ package redplex
 import (
 	"bufio"
 	"bytes"
+	"math/rand"
 	"net"
 	"sync"
 	"time"
@@ -109,10 +110,13 @@ type Pubsub struct {
 	closer       chan struct{}
 	writeTimeout time.Duration
 
-	mu         sync.Mutex
-	connection net.Conn
-	patterns   listenerMap
-	channels   listenerMap
+	mu              sync.Mutex
+	connection      net.Conn
+	patterns        listenerMap
+	channels        listenerMap
+	unstableSince   time.Time
+	unstableFired   bool
+	onUnstableStall func()
 }
 
 // NewPubsub creates a new Pubsub instance.
@@ -130,7 +134,8 @@ func NewPubsub(dialer Dialer, writeTimeout time.Duration) *Pubsub {
 func (p *Pubsub) Start() {
 	bo := backoff.NewExponentialBackOff()
 	bo.MaxInterval = time.Second * 10
-	const stableThreshold = 15 * time.Second
+	stableAfter := time.Second * 30
+	unstableAfter := randomDuration(time.Minute*4, time.Minute)
 
 	for {
 		cnx, err := p.dialer.Dial()
@@ -145,6 +150,7 @@ func (p *Pubsub) Start() {
 		connectedAt := time.Now()
 		err = p.read(cnx)
 		uptime := time.Since(connectedAt)
+		p.handleConnectionUptime(uptime, stableAfter, unstableAfter)
 
 		select {
 		case <-p.closer:
@@ -153,7 +159,7 @@ func (p *Pubsub) Start() {
 			logrus.WithError(err).Info("redplex/pubsub: lost connection to pubsub server")
 		}
 
-		if uptime >= stableThreshold {
+		if uptime >= stableAfter {
 			bo.Reset()
 			continue
 		}
@@ -162,6 +168,13 @@ func (p *Pubsub) Start() {
 			return
 		}
 	}
+}
+
+// OnUnstable registers a callback that fires when connections fail to stay up.
+func (p *Pubsub) OnUnstable(cb func()) {
+	p.mu.Lock()
+	p.onUnstableStall = cb
+	p.mu.Unlock()
 }
 
 func (p *Pubsub) waitForReconnect(bo *backoff.ExponentialBackOff) bool {
@@ -328,4 +341,37 @@ func (p *Pubsub) read(cnx net.Conn) error {
 		}
 		p.mu.Unlock()
 	}
+}
+
+func (p *Pubsub) handleConnectionUptime(uptime, stableThreshold, unstableAfter time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if uptime >= stableThreshold {
+		p.unstableSince = time.Time{}
+		p.unstableFired = false
+		return
+	}
+
+	if p.unstableSince.IsZero() {
+		p.unstableSince = time.Now().Add(-uptime)
+	}
+
+	if p.unstableFired || time.Since(p.unstableSince) < unstableAfter {
+		return
+	}
+
+	cb := p.onUnstableStall
+	p.unstableFired = true
+
+	if cb != nil {
+		go cb()
+	}
+}
+
+func randomDuration(minWindow, jitter time.Duration) time.Duration {
+	if jitter <= 0 {
+		return minWindow
+	}
+	return minWindow + time.Duration(rand.Int63n(int64(jitter)))
 }
