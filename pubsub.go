@@ -128,24 +128,23 @@ func NewPubsub(dialer Dialer, writeTimeout time.Duration) *Pubsub {
 
 // Start creates a pubsub listener to proxy connection data.
 func (p *Pubsub) Start() {
-	backoff := backoff.NewExponentialBackOff()
-	backoff.MaxInterval = time.Second * 10
+	bo := backoff.NewExponentialBackOff()
+	bo.MaxInterval = time.Second * 10
+	const stableThreshold = 15 * time.Second
 
 	for {
 		cnx, err := p.dialer.Dial()
 		if err != nil {
 			logrus.WithError(err).Info("redplex/pubsub: error dialing to pubsub master")
-			select {
-			case <-time.After(backoff.NextBackOff()):
-				serverReconnects.Inc()
+			if p.waitForReconnect(bo) {
 				continue
-			case <-p.closer:
-				return
 			}
+			return
 		}
 
-		backoff.Reset()
+		connectedAt := time.Now()
 		err = p.read(cnx)
+		uptime := time.Since(connectedAt)
 
 		select {
 		case <-p.closer:
@@ -153,6 +152,30 @@ func (p *Pubsub) Start() {
 		default:
 			logrus.WithError(err).Info("redplex/pubsub: lost connection to pubsub server")
 		}
+
+		if uptime >= stableThreshold {
+			bo.Reset()
+			continue
+		}
+
+		if !p.waitForReconnect(bo) {
+			return
+		}
+	}
+}
+
+func (p *Pubsub) waitForReconnect(bo *backoff.ExponentialBackOff) bool {
+	d := bo.NextBackOff()
+	if d == backoff.Stop {
+		return false
+	}
+
+	select {
+	case <-time.After(d):
+		serverReconnects.Inc()
+		return true
+	case <-p.closer:
+		return false
 	}
 }
 
