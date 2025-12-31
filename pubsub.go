@@ -117,6 +117,8 @@ type Pubsub struct {
 	unstableSince   time.Time
 	unstableFired   bool
 	onUnstableStall func()
+	onConnStart     func(attempt int)
+	onConnEnd       func(attempt int, uptime time.Duration, err error)
 }
 
 // NewPubsub creates a new Pubsub instance.
@@ -137,9 +139,14 @@ func (p *Pubsub) Start() {
 	stableAfter := time.Second * 30
 	unstableAfter := randomDuration(time.Minute*4, time.Minute)
 
+	attempt := 0
 	for {
+		currentAttempt := attempt
+		p.fireConnectionStart(currentAttempt)
+		attempt++
 		cnx, err := p.dialer.Dial()
 		if err != nil {
+			p.fireConnectionEnd(currentAttempt, 0, err)
 			logrus.WithError(err).Info("redplex/pubsub: error dialing to pubsub master")
 			if p.waitForReconnect(bo) {
 				continue
@@ -151,6 +158,7 @@ func (p *Pubsub) Start() {
 		err = p.read(cnx)
 		uptime := time.Since(connectedAt)
 		p.handleConnectionUptime(uptime, stableAfter, unstableAfter)
+		p.fireConnectionEnd(currentAttempt, uptime, err)
 
 		select {
 		case <-p.closer:
@@ -174,6 +182,21 @@ func (p *Pubsub) Start() {
 func (p *Pubsub) OnUnstable(cb func()) {
 	p.mu.Lock()
 	p.onUnstableStall = cb
+	p.mu.Unlock()
+}
+
+// OnConnectionStart registers a callback invoked before each connect attempt.
+func (p *Pubsub) OnConnectionStart(cb func(attempt int)) {
+	p.mu.Lock()
+	p.onConnStart = cb
+	p.mu.Unlock()
+}
+
+// OnConnectionEnd registers a callback invoked when a connection attempt ends.
+// uptime is zero when the dial fails before establishing a connection.
+func (p *Pubsub) OnConnectionEnd(cb func(attempt int, uptime time.Duration, err error)) {
+	p.mu.Lock()
+	p.onConnEnd = cb
 	p.mu.Unlock()
 }
 
@@ -366,6 +389,26 @@ func (p *Pubsub) handleConnectionUptime(uptime, stableThreshold, unstableAfter t
 
 	if cb != nil {
 		go cb()
+	}
+}
+
+func (p *Pubsub) fireConnectionStart(attempt int) {
+	p.mu.Lock()
+	cb := p.onConnStart
+	p.mu.Unlock()
+
+	if cb != nil {
+		go cb(attempt)
+	}
+}
+
+func (p *Pubsub) fireConnectionEnd(attempt int, uptime time.Duration, err error) {
+	p.mu.Lock()
+	cb := p.onConnEnd
+	p.mu.Unlock()
+
+	if cb != nil {
+		go cb(attempt, uptime, err)
 	}
 }
 
